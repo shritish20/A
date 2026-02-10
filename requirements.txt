@@ -1,0 +1,28 @@
+# Core Framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+
+# Database
+sqlalchemy==2.0.25
+
+# Scientific Computing
+pandas==2.1.4
+numpy==1.26.3
+scipy==1.11.4
+
+# Date/Time
+pytz==2023.3
+
+# HTTP Client (for Telegram and FII data)
+aiohttp==3.9.1
+requests==2.31.0
+
+# Upstox SDK
+upstox-python-sdk==2.5.0
+
+# CORS Support
+python-multipart==0.0.6
+
+# Environment Variables (optional but recommended)
+python-dotenv==1.0.0
