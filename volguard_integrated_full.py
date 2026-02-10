@@ -22,6 +22,8 @@ from decimal import Decimal
 from collections import defaultdict
 import io
 from concurrent.futures import ThreadPoolExecutor
+import urllib.parse
+import copy
 
 # Third-party imports
 import pandas as pd
@@ -715,6 +717,15 @@ class JSONCacheManager:
                 return None
             return self._data.copy()
     
+    def is_valid_for_today(self) -> bool:
+        """Check if cache is valid for today"""
+        cache = self.get_today_cache()
+        return cache is not None and cache.get("is_valid", False)
+    
+    def get_context(self) -> Dict:
+        """Get raw context data"""
+        return self._data.copy()
+    
     def fetch_and_cache(self, force: bool = False) -> bool:
         """Fetch FII/DII and Economic Events, cache to JSON file"""
         with self._lock:
@@ -864,7 +875,10 @@ class JSONCacheManager:
                 self.logger.info(f"Next fetch at {next_fetch} (sleeping {sleep_seconds/3600:.1f} hours)")
                 await asyncio.sleep(sleep_seconds)
                 
-                success = self.fetch_and_cache()
+                # FIX #6: Non-blocking daily fetch using thread executor
+                loop = asyncio.get_running_loop()
+                success = await loop.run_in_executor(None, self.fetch_and_cache)
+                
                 if not success:
                     await asyncio.sleep(3600)  # Retry in 1 hour
                     
@@ -874,7 +888,7 @@ class JSONCacheManager:
 
 
 # ============================================================================
-# UPSTOX SDK DATA FETCHER - ZERO CACHE, REAL API ONLY, V3 ARGS FIXED
+# UPSTOX SDK DATA FETCHER - ZERO CACHE, REAL API ONLY, V3 CORRECTED
 # ============================================================================
 
 class UpstoxFetcher:
@@ -883,7 +897,7 @@ class UpstoxFetcher:
     - No cached data, no synthetic data
     - If API fails, return None - caller must handle
     - Real-time only, every call hits Upstox API
-    - V3 SDK: Fixed unit/interval arguments
+    - V3 SDK: Fixed unit/interval arguments, proper API usage
     """
     
     def __init__(self, token: str):
@@ -899,10 +913,15 @@ class UpstoxFetcher:
         self.options_api = upstox_client.OptionsApi(self.api_client)
         self.user_api = upstox_client.UserApi(self.api_client)
         self.order_api = upstox_client.OrderApi(self.api_client)
-        self.gtt_api = upstox_client.GttApi(self.api_client)  # NEW: GTT API
+        
+        # FIX #1: Initialize OrderApiV3 for GTT operations (GttApi removed in V3)
+        self.order_api_v3 = upstox_client.OrderApiV3(self.api_client)
+        
+        # FIX #4: Initialize MarketQuoteV3Api for Greeks
+        self.quote_api_v3 = upstox_client.MarketQuoteV3Api(self.api_client)
         
         self.logger = logging.getLogger(self.__class__.__name__)
-        self.logger.info("UpstoxFetcher initialized - ZERO CACHE MODE")
+        self.logger.info("UpstoxFetcher initialized - ZERO CACHE MODE, V3 SDK")
 
     def get_funds(self) -> Optional[float]:
         """Fetch available margin (Equity) for trading - REAL API ONLY"""
@@ -927,16 +946,20 @@ class UpstoxFetcher:
     def history(self, key: str, days: int = 400) -> Optional[pd.DataFrame]:
         """
         Fetch historical candles - REAL API ONLY
-        V3 FIX: unit="day", interval="1" (separate arguments)
+        V3 FIX: unit="days" (plural), URL encoding for instrument key
         Returns None on failure (NO FALLBACK)
         """
         try:
             to_date = date.today().strftime("%Y-%m-%d")
             from_date = (date.today() - timedelta(days=days)).strftime("%Y-%m-%d")
             
+            # FIX #5: URL encode the instrument key for safety
+            encoded_key = urllib.parse.quote(key, safe='')
+            
+            # FIX #3: Use plural "days" not "day"
             response = self.history_api.get_historical_candle_data1(
-                instrument_key=key,
-                unit="day",        # V3: separate unit
+                instrument_key=encoded_key,
+                unit="days",        # V3: plural 'days'
                 interval="1",      # V3: separate interval
                 to_date=to_date,
                 from_date=from_date
@@ -962,7 +985,9 @@ class UpstoxFetcher:
         Returns None on failure (NO FALLBACK)
         """
         try:
-            response = self.quote_api.get_ltp(instrument_key=",".join(keys))
+            # URL encode keys for safety
+            encoded_keys = [urllib.parse.quote(k, safe='') for k in keys]
+            response = self.quote_api.get_ltp(instrument_key=",".join(encoded_keys))
             
             if response.status == "success" and response.data:
                 result = {}
@@ -1088,24 +1113,27 @@ class UpstoxFetcher:
     
     def get_greeks(self, instrument_keys: List[str]) -> Dict[str, Dict]:
         """
-        Fetch live Greeks from Upstox V3 - NEW IN V3.2
-        Returns dict of {instrument_key: {iv, delta, gamma, theta, vega, spot_price}}
+        Fetch live Greeks from Upstox V3 - FIXED #4
+        Uses MarketQuoteV3Api.get_market_quote_option_greek for proper Greek data
         """
         try:
             if not instrument_keys:
                 return {}
             
-            # Use the option contract details endpoint which includes Greeks
-            response = self.quote_api.get_full_market_quote(
-                symbol=",".join(instrument_keys),
+            # URL encode keys
+            encoded_keys = [urllib.parse.quote(k, safe='') for k in instrument_keys]
+            
+            # FIX #4: Use V3 Greek API instead of full market quote
+            response = self.quote_api_v3.get_market_quote_option_greek(
+                instrument_key=",".join(encoded_keys),
                 api_version="2.0"
             )
             
             result = {}
             if response.status == "success" and response.data:
                 for key, data in response.data.items():
-                    # Extract Greeks from the response
-                    greeks_data = getattr(data, 'greeks', None) if hasattr(data, 'greeks') else None
+                    # Extract Greeks from the V3 response structure
+                    greeks_data = getattr(data, 'option_greeks', None) if hasattr(data, 'option_greeks') else None
                     
                     if greeks_data:
                         result[key] = {
@@ -2605,7 +2633,7 @@ class StrategyFactory:
 
 
 # ============================================================================
-# EXECUTION ENGINE (MOCK + REAL) - V34.0 UPDATED WITH GTT
+# EXECUTION ENGINE (MOCK + REAL) - V34.0 UPDATED WITH GTT FIXES
 # ============================================================================
 
 class MockExecutor:
@@ -2659,6 +2687,7 @@ class SafeExecutor:
     """
     VolGuard Execution Layer - v34.0 (Safe Mode with GTT)
     Replaces RealExecutor with Capital Checks, Verification, and Server-Side Stop Losses
+    FIXED: Uses OrderApiV3 for GTT operations per Upstox SDK V3
     """
     
     def __init__(self, fetcher: UpstoxFetcher):
@@ -2667,9 +2696,10 @@ class SafeExecutor:
         
         self.fetcher = fetcher
         self.order_api = fetcher.order_api
-        self.gtt_api = fetcher.gtt_api
+        # FIX #1: Use OrderApiV3 for GTT (GttApi removed in V3)
+        self.order_api_v3 = fetcher.order_api_v3
         self.logger = logging.getLogger(self.__class__.__name__)
-        self.logger.info("SafeExecutor initialized with Funds Check, Order Verification, and GTT")
+        self.logger.info("SafeExecutor initialized with Funds Check, Order Verification, and GTT (V3 SDK)")
     
     def place_multi_order(self, strategy: ConstructedStrategy) -> Dict:
         """
@@ -2796,7 +2826,7 @@ class SafeExecutor:
     def _place_gtt_stop_losses(self, strategy: ConstructedStrategy, filled_order_ids: List[str]) -> List[str]:
         """
         Place server-side GTT stop losses for short legs.
-        These are held by Upstox, not our script.
+        FIXED #2: Uses OrderApiV3 and ENTRY strategy for single-leg GTT per V3 SDK
         """
         gtt_ids = []
         
@@ -2808,9 +2838,10 @@ class SafeExecutor:
             stop_price = round(leg.entry_price * 2.0, 2)
             
             try:
-                # Create OCO GTT rule
+                # FIX #2: Use ENTRY strategy for single-leg GTT (required by V3 SDK)
+                # FIX #1: Use order_api_v3 instead of gtt_api
                 rule = upstox_client.GttRule(
-                    strategy="STOPLOSS",
+                    strategy="ENTRY",  # Must be ENTRY for single-leg type in V3
                     trigger_type="IMMEDIATE",
                     trigger_price=stop_price
                 )
@@ -2824,7 +2855,8 @@ class SafeExecutor:
                     rules=[rule]
                 )
                 
-                response = self.gtt_api.place_gtt_order(body=body)
+                # FIX #1: Use OrderApiV3 for GTT placement
+                response = self.order_api_v3.place_gtt_order(body=body)
                 
                 if response.status == "success":
                     gtt_id = response.data.gtt_order_id
@@ -2843,7 +2875,8 @@ class SafeExecutor:
         success = True
         for gtt_id in gtt_ids:
             try:
-                self.gtt_api.delete_gtt_order(gtt_id)
+                # FIX #1: Use OrderApiV3 for GTT deletion
+                self.order_api_v3.delete_gtt_order(gtt_id)
                 self.logger.info(f"Cancelled GTT: {gtt_id}")
             except Exception as e:
                 self.logger.error(f"Failed to cancel GTT {gtt_id}: {e}")
@@ -2870,7 +2903,10 @@ class AnalyticsCache:
     def get(self) -> Optional[Dict]:
         """Get cached analytics if valid"""
         with self._lock:
-            return self._cache
+            # FIX: Return deep copy to prevent external mutation
+            if self._cache is None:
+                return None
+            return copy.deepcopy(self._cache)
     
     def should_recalculate(self, current_spot: float, current_vix: float) -> bool:
         """
@@ -2922,7 +2958,8 @@ class AnalyticsCache:
     def update(self, analysis_data: Dict, spot: float, vix: float):
         """Update cache with new analytics"""
         with self._lock:
-            self._cache = analysis_data
+            # FIX: Deep copy to prevent external mutation affecting cache
+            self._cache = copy.deepcopy(analysis_data)
             self._last_spot = spot
             self._last_vix = vix
             self._last_calc_time = datetime.now(self.ist_tz)
@@ -2934,6 +2971,7 @@ class AnalyticsScheduler:
     Background scheduler for heavy analytics using ThreadPoolExecutor.
     Runs every 15min (market hours) or 60min (off-hours)
     Plus volatility-triggered immediate runs.
+    FIXED: Proper executor lifecycle management
     """
     
     def __init__(self, volguard_system, cache: AnalyticsCache):
@@ -2942,11 +2980,13 @@ class AnalyticsScheduler:
         self.ist_tz = pytz.timezone('Asia/Kolkata')
         self.logger = logging.getLogger(self.__class__.__name__)
         self._running = False
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="analytics")
+        self._executor: Optional[ThreadPoolExecutor] = None  # FIX: Don't create in __init__
     
     async def start(self):
         """Start the scheduler loop with ThreadPoolExecutor"""
         self._running = True
+        # FIX: Create executor here, not in __init__
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="analytics")
         self.logger.info("Analytics scheduler started with ThreadPoolExecutor")
         loop = asyncio.get_event_loop()
         
@@ -2995,7 +3035,10 @@ class AnalyticsScheduler:
     def stop(self):
         """Stop the scheduler"""
         self._running = False
-        self._executor.shutdown(wait=True)
+        # FIX: Proper cleanup with None check
+        if self._executor:
+            self._executor.shutdown(wait=True)
+            self._executor = None
         self.logger.info("Analytics scheduler stopped")
 
 
@@ -3016,6 +3059,9 @@ class PositionMonitor:
         self.logger = logging.getLogger(self.__class__.__name__)
         self.is_running = False
         self.ist_tz = pytz.timezone('Asia/Kolkata')
+        # FIX: Track breach count for sustained circuit breaker
+        self._breach_count = 0
+        self._breach_threshold = 3  # Require 3 consecutive breaches
     
     async def start_monitoring(self):
         """Background monitoring loop - 5s intervals for live P&L"""
@@ -3032,6 +3078,7 @@ class PositionMonitor:
     
     async def check_all_positions(self):
         """CRITICAL: Real-time P&L and circuit breaker using cached analytics, ABORTS if data missing"""
+        # FIX: Create new session for each check cycle (thread safety)
         db = self.db_session_factory()
         try:
             active_trades = db.query(TradeJournal).filter(
@@ -3075,13 +3122,16 @@ class PositionMonitor:
             
             self._update_daily_stats(db, total_realized_pnl, total_unrealized_pnl)
             
-            # Circuit breaker check
-            total_pnl = total_realized_pnl + total_unrealized_pnl
+            # Circuit breaker check - FIX: Only trigger on realized P&L to avoid noise
             threshold = -SystemConfig.BASE_CAPITAL * SystemConfig.CIRCUIT_BREAKER_PCT / 100
             
-            if total_pnl < threshold:
-                self.logger.critical(f"🚨 CIRCUIT BREAKER TRIGGERED! P&L: ₹{total_pnl:.2f} < ₹{threshold:.2f}")
-                await self.trigger_circuit_breaker(db)
+            if total_realized_pnl < threshold:
+                self._breach_count += 1
+                if self._breach_count >= self._breach_threshold:
+                    self.logger.critical(f"🚨 CIRCUIT BREAKER TRIGGERED! Realized P&L: ₹{total_realized_pnl:.2f} < ₹{threshold:.2f}")
+                    await self.trigger_circuit_breaker(db)
+            else:
+                self._breach_count = 0  # Reset on recovery
         
         finally:
             db.close()
@@ -4018,4 +4068,4 @@ if __name__ == "__main__":
         host=SystemConfig.HOST,
         port=SystemConfig.PORT,
         log_level="info"
-  )
+    )
