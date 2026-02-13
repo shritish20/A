@@ -1,15 +1,7 @@
 """
 VolGuard v3.3 - Production FastAPI Backend
 ================================================================
-FINAL PRODUCTION VERSION - ALL AUDIT ISSUES FIXED
-- ✅ GetMarginRequest → MarginRequest (correct SDK class)
-- ✅ P&L API: Added page_number/page_size
-- ✅ History: "days" unit (plural) correct
-- ✅ PortfolioStreamer: Fixed order_api reference
-- ✅ Chain: Bid/Ask from market_data (correct nesting)
-- ✅ Greeks: Added separate spot price fetch
-- ✅ StrategyFactory: All 6 strategies implemented
-- ✅ 100% Upstox SDK v2.19.0 aligned
+
 ================================================================
 """
 
@@ -5754,6 +5746,7 @@ def get_professional_dashboard(
         logger.error(f"Professional dashboard error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/api/live/positions", response_model=LivePositionsResponse)
 def get_live_positions(
     db: Session = Depends(get_db),
@@ -5832,4 +5825,298 @@ def get_live_positions(
         
         return {
             "mtm_pnl": round(total_mtm_pnl, 2),
-            "
+            "pnl_color": pnl_color,
+            "greeks": {
+                "delta": round(total_delta, 2),
+                "theta": round(total_theta, 2),
+                "vega": round(total_vega, 2),
+                "gamma": round(total_gamma, 2)
+            },
+            "positions": positions_list,
+            "market_status": market_status
+        }
+        
+    except Exception as e:
+        logger.error(f"Live positions error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/journal/history", response_model=List[TradeJournalEntry])
+def get_journal_history(
+    limit: int = 50,
+    db: Session = Depends(get_db),
+    token: str = Depends(verify_token)
+):
+    try:
+        trades = db.query(TradeJournal).filter(
+            TradeJournal.status != TradeStatus.ACTIVE.value
+        ).order_by(desc(TradeJournal.exit_time)).limit(limit).all()
+        
+        history = []
+        for trade in trades:
+            if trade.realized_pnl and trade.realized_pnl > 0:
+                result = "WIN"
+            elif trade.realized_pnl and trade.realized_pnl < 0:
+                result = "LOSS"
+            else:
+                result = "BREAKEVEN"
+            
+            history.append({
+                "date": trade.exit_time.strftime("%Y-%m-%d") if trade.exit_time else trade.entry_time.strftime("%Y-%m-%d"),
+                "strategy": trade.strategy_type,
+                "result": result,
+                "pnl": round(trade.realized_pnl or 0, 2),
+                "exit_reason": trade.exit_reason or "UNKNOWN"
+            })
+        
+        return history
+        
+    except Exception as e:
+        logger.error(f"Journal history error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/system/config")
+def update_system_config(
+    config_update: ConfigUpdateRequest,
+    db: Session = Depends(get_db),
+    token: str = Depends(verify_token)
+):
+    try:
+        updates = {}
+        if config_update.max_loss is not None:
+            updates["MAX_LOSS_PCT"] = config_update.max_loss
+        if config_update.profit_target is not None:
+            updates["PROFIT_TARGET"] = config_update.profit_target
+        if config_update.base_capital is not None:
+            updates["BASE_CAPITAL"] = config_update.base_capital
+        if config_update.auto_trading is not None:
+            updates["AUTO_TRADING"] = config_update.auto_trading
+        if config_update.min_oi is not None:
+            updates["MIN_OI"] = config_update.min_oi
+        if config_update.max_spread_pct is not None:
+            updates["MAX_BID_ASK_SPREAD_PCT"] = config_update.max_spread_pct
+        if config_update.max_position_risk_pct is not None:
+            updates["MAX_POSITION_RISK_PCT"] = config_update.max_position_risk_pct
+        if config_update.max_concurrent_same_strategy is not None:
+            updates["MAX_CONCURRENT_SAME_STRATEGY"] = config_update.max_concurrent_same_strategy
+        
+        changed = DynamicConfig.update(updates)
+        
+        logger.info(f"Configuration updated via API: {changed}")
+        
+        if "AUTO_TRADING" in changed and volguard_system and volguard_system.alert_service:
+            status = "ENABLED" if changed["AUTO_TRADING"] else "DISABLED"
+            volguard_system.alert_service.send(
+                "Auto Trading Toggled",
+                f"Auto trading has been {status} via system config",
+                AlertPriority.HIGH if changed["AUTO_TRADING"] else AlertPriority.MEDIUM
+            )
+        
+        return {
+            "success": True,
+            "updated": changed,
+            "current_config": DynamicConfig.to_dict()
+        }
+        
+    except Exception as e:
+        logger.error(f"Config update error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/system/logs", response_model=SystemLogsResponse)
+def get_system_logs(
+    lines: int = 50,
+    level: Optional[str] = None,
+    token: str = Depends(verify_token)
+):
+    try:
+        logs = log_buffer.get_logs(lines=lines, level=level)
+        return {
+            "logs": logs,
+            "total_lines": len(logs)
+        }
+    except Exception as e:
+        logger.error(f"Logs fetch error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/system/config/current")
+def get_current_config(
+    token: str = Depends(verify_token)
+):
+    return DynamicConfig.to_dict()
+
+@app.get("/api/risk/correlation-report")
+def get_correlation_report(
+    token: str = Depends(verify_token)
+):
+    if not volguard_system:
+        raise HTTPException(status_code=503, detail="System not initialized")
+    
+    report = volguard_system.correlation_manager.get_correlation_report()
+    
+    return {
+        "timestamp": datetime.now().isoformat(),
+        "report": report
+    }
+
+@app.get("/api/risk/expiries")
+def get_expiry_status(
+    token: str = Depends(verify_token)
+):
+    if not volguard_system:
+        raise HTTPException(status_code=503, detail="System not initialized")
+    
+    ist = pytz.timezone('Asia/Kolkata')
+    now = datetime.now(ist)
+    today = now.date()
+    
+    weekly, monthly, next_weekly, lot_size, all_expiries = volguard_system.fetcher.get_expiries()
+    
+    return {
+        "timestamp": now.isoformat(),
+        "expiries": {
+            "weekly": {
+                "date": weekly.isoformat() if weekly else None,
+                "dte": (weekly - today).days if weekly else None,
+                "trading_blocked": (weekly == today) if weekly else False,
+                "square_off_required": (weekly - today).days == 1 if weekly else False,
+                "square_off_time": "14:00 IST"
+            },
+            "monthly": {
+                "date": monthly.isoformat() if monthly else None,
+                "dte": (monthly - today).days if monthly else None,
+                "trading_blocked": (monthly == today) if monthly else False,
+                "square_off_required": (monthly - today).days == 1 if monthly else False,
+                "square_off_time": "14:00 IST"
+            },
+            "next_weekly": {
+                "date": next_weekly.isoformat() if next_weekly else None,
+                "dte": (next_weekly - today).days if next_weekly else None,
+                "trading_blocked": (next_weekly == today) if next_weekly else False,
+                "square_off_required": (next_weekly - today).days == 1 if next_weekly else False,
+                "square_off_time": "14:00 IST"
+            }
+        },
+        "all_expiries": [e.isoformat() for e in all_expiries]
+    }
+
+@app.get("/")
+def root():
+    return {
+        "system": "VolGuard v3.3",
+        "version": "3.3.0",
+        "status": "operational",
+        "trading_mode": "OVERNIGHT OPTION SELLING",
+        "product_type": "D (Delivery/Carryforward)",
+        "square_off": "1 day before expiry @ 14:00 IST",
+        "data_source": "Smart Fallback (WebSocket + REST)",
+        "websocket": {
+            "market_streamer": "ACTIVE" if volguard_system and volguard_system.market_streamer_started else "INACTIVE",
+            "portfolio_streamer": "ACTIVE" if volguard_system and volguard_system.portfolio_streamer_started else "INACTIVE"
+        },
+        "endpoints": {
+            "market_status": "/api/market/status",
+            "last_price": "/api/market/last-price/{instrument_key}",
+            "bulk_prices": "/api/market/bulk-last-price",
+            "ohlc": "/api/market/ohlc/{instrument_key}",
+            "analytics": "/api/dashboard/analytics",
+            "professional": "/api/dashboard/professional",
+            "live": "/api/live/positions",
+            "journal": "/api/journal/history",
+            "config": "/api/system/config",
+            "logs": "/api/system/logs",
+            "correlation": "/api/risk/correlation-report",
+            "expiries": "/api/risk/expiries"
+        }
+    }
+
+@app.get("/api/health")
+def health_check(db: Session = Depends(get_db)):
+    try:
+        db.execute(text("SELECT 1"))
+        db_status = True
+    except:
+        db_status = False
+    
+    circuit_breaker_state = db.query(TradeJournal).filter(
+        TradeJournal.status == TradeStatus.CLOSED_CIRCUIT_BREAKER.value
+    ).first()
+    
+    circuit_breaker_active = circuit_breaker_state is not None
+    
+    cache_status = "VALID" if volguard_system and volguard_system.json_cache.is_valid_for_today() else "MISSING"
+    
+    market_streamer_status = "CONNECTED" if volguard_system and volguard_system.fetcher.market_streamer.is_connected else "DISCONNECTED"
+    portfolio_streamer_status = "CONNECTED" if volguard_system and volguard_system.fetcher.portfolio_streamer.is_connected else "DISCONNECTED"
+    
+    return {
+        "status": "healthy" if (db_status and not circuit_breaker_active) else "degraded",
+        "database": db_status,
+        "daily_cache": cache_status,
+        "auto_trading": DynamicConfig.AUTO_TRADING,
+        "mock_trading": DynamicConfig.ENABLE_MOCK_TRADING,
+        "product_type": "D (Overnight)",
+        "circuit_breaker": "ACTIVE" if circuit_breaker_active else "NORMAL",
+        "data_source": "Smart Fallback",
+        "websocket": {
+            "market_streamer": market_streamer_status,
+            "portfolio_streamer": portfolio_streamer_status,
+            "subscribed_instruments": len(volguard_system.fetcher.market_streamer.get_subscribed_instruments()) if volguard_system else 0
+        },
+        "analytics_cache_age": (
+            (datetime.now() - volguard_system.analytics_cache._last_calc_time).total_seconds() // 60
+            if volguard_system and volguard_system.analytics_cache._last_calc_time
+            else "N/A"
+        ),
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.post("/api/emergency/exit-all")
+def emergency_exit_all(token: str = Depends(verify_token)):
+    if not volguard_system:
+        raise HTTPException(status_code=503, detail="System not initialized")
+    result = volguard_system.fetcher.emergency_exit_all_positions()
+    if result["success"] and volguard_system.alert_service:
+        volguard_system.alert_service.send(
+            "EMERGENCY EXIT",
+            f"Orders: {result['orders_placed']}",
+            AlertPriority.CRITICAL,
+            throttle_key="emergency_exit"
+        )
+    return result
+
+
+# ============================================================================
+# MAIN ENTRY POINT
+# ============================================================================
+
+if __name__ == "__main__":
+    import uvicorn
+    
+    print("=" * 80)
+    print("🚀 VolGuard v3.3 - FINAL PRODUCTION VERSION")
+    print("=" * 80)
+    print(f"🎯 Trading Mode:    OVERNIGHT OPTION SELLING")
+    print(f"📦 Product Type:    D (Delivery/Carryforward)")
+    print(f"💰 Base Capital:    ₹{DynamicConfig.DEFAULTS['BASE_CAPITAL']:,.2f}")
+    print(f"🤖 Auto Trading:    {'ENABLED 🔴' if DynamicConfig.DEFAULTS['AUTO_TRADING'] else 'DISABLED 🟡'}")
+    print(f"🔄 Data Source:     Smart Fallback (WebSocket + REST)")
+    print(f"🌐 Market Hours:    WebSocket (real-time) / REST API (24/7)")
+    print(f"🛡️ GTT Orders:      ✅ Multi-leg with Trailing Stop (FIXED)")
+    print(f"🚪 Exit Orders:     ✅ Actual MARKET orders")
+    print(f"📅 Square Off:      ✅ 1 day BEFORE expiry @ 14:00 IST")
+    print(f"🚫 Expiry Trading:  ✅ BLOCKED")
+    print(f"🎯 Correlation Mgr: ✅ Active")
+    print(f"📊 POP:             ✅ From Upstox SDK")
+    print(f"🔒 Auth:            ✅ Environment fallback with warning")
+    print(f"📏 Lot Size:        ✅ Dynamic from Upstox (NOT hardcoded)")
+    print(f"⚡ Async:           ✅ DB/HTTP in executors (FIXED)")
+    print(f"📈 Circuit Breaker: ✅ Uses Total MTM (FIXED)")
+    print("=" * 80)
+    print(f"📚 API Documentation: http://localhost:{SystemConfig.PORT}/docs")
+    print("=" * 80)
+    
+    uvicorn.run(
+        "volguard_final:app",
+        host=SystemConfig.HOST,
+        port=SystemConfig.PORT,
+        log_level="info"
+    )
