@@ -555,9 +555,8 @@ class SystemConfig:
     def MAX_CONCURRENT_SAME_STRATEGY(cls):
         return DynamicConfig.MAX_CONCURRENT_SAME_STRATEGY
 
-
 # ============================================================================
-# AUTHENTICATION - FIXED: NO FALLBACK TOKEN
+# AUTHENTICATION - FIXED: Restores env fallback with warning
 # ============================================================================
 
 security = HTTPBearer(auto_error=False)
@@ -565,10 +564,14 @@ security = HTTPBearer(auto_error=False)
 async def verify_token(x_upstox_token: Optional[str] = Header(None, alias="X-Upstox-Token")):
     """
     V3.3 SPEC: Verify Upstox access token from header.
-    Returns token if valid, raises 401 if missing.
-    NO FALLBACK - Token must be provided in header.
+    Falls back to environment variable for development/testing.
+    In production, always pass the token in header.
     """
     if not x_upstox_token:
+        # For development: allow token from environment
+        if SystemConfig.UPSTOX_ACCESS_TOKEN:
+            logger.warning("⚠️ Using UPSTOX_ACCESS_TOKEN from environment - only for development!")
+            return SystemConfig.UPSTOX_ACCESS_TOKEN
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing X-Upstox-Token header"
