@@ -1,0 +1,40 @@
+# Environment
+.env
+.env.local
+.env.production
+
+# Database
+*.db
+*.db-journal
+/data/
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+/logs/
+volguard.log
+
+# Cache
+__pycache__/
+*.pyc
+.pytest_cache/
+daily_context.json
+daily_context.json.tmp
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Virtual Environment
+venv/
+env/
+.venv/
+
+# Distribution
+dist/
+build/
+*.egg-info/
