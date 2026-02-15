@@ -1,8 +1,6 @@
 """
-VolGuard v3.5 - Production FastAPI Backend
-================================================================
+VolGuard v3.5 
 
-================================================================
 """
 
 import os
@@ -7100,4 +7098,5 @@ if __name__ == "__main__":
         host=SystemConfig.HOST,
         port=SystemConfig.PORT,
         log_level="info"
+
     )
