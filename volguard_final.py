@@ -7047,7 +7047,7 @@ if __name__ == "__main__":
     import uvicorn
     
     print("=" * 80)
-    print("🚀 VolGuard v3.5 - FULLY AUTOMATED HEDGE FUND")
+    print("🚀 VolGuard v3.5")
     print("=" * 80)
     print(f"🎯 Trading Mode:    OVERNIGHT OPTION SELLING")
     print(f"📦 Product Type:    D (Delivery/Carryforward)")
